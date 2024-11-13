@@ -1,8 +1,11 @@
 package dbresolver
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
+	"fmt"
 )
 
 type Row []interface{}
@@ -78,5 +81,14 @@ func ToRow(rows *sql.Rows) (*Row, error) {
 	}
 
 	return nil, errors.New("something_went_wrong")
+}
 
+func HashValues(values ...interface{}) string {
+	hasher := sha256.New()
+	for _, value := range values {
+		strValue := fmt.Sprintf("%v", value)
+		hasher.Write([]byte(strValue))
+	}
+
+	return hex.EncodeToString(hasher.Sum(nil))
 }

@@ -177,6 +177,11 @@ func WithHooks(eventHandler hooks.EventEmitter) DataBaseOpts {
 	}
 }
 
+func ToKey(stmt string, values ...interface{}) string {
+	hashed := HashValues(values...)
+	return fmt.Sprintf("%s_%s", stmt, hashed)
+}
+
 func (d *Database) WithMode(dbMode DbActionMode) *Database {
 	dbConfig := d.Config
 	dbConfig.DefaultMode = &dbMode
@@ -204,7 +209,7 @@ func (d *Database) Exec(stmt string, values ...interface{}) (sql.Result, error) 
 
 	defer func() {
 		if d.koalescer != nil {
-			d.koalescer.Forget(stmt)
+			d.koalescer.Forget(ToKey(stmt, values...))
 		}
 	}()
 
@@ -224,7 +229,7 @@ func (d *Database) ExecContext(ctx context.Context, stmt string, values ...inter
 
 	defer func() {
 		if d.koalescer != nil {
-			d.koalescer.ForgetWithContext(ctx, stmt)
+			d.koalescer.ForgetWithContext(ctx, ToKey(stmt, values...))
 		}
 	}()
 
@@ -235,10 +240,18 @@ func (d *Database) Query(stmt string, values ...interface{}) (Rows, error) {
 	d.Hooks.Emit(EventBeforeQueryRun, stmt, values)
 
 	source := d.selectSource()
+	key := ""
+
+	if d.koalescer != nil {
+		key = ToKey(stmt, values...)
+	}
 
 	if isDML(strings.ToLower(stmt)) {
 		source = d.getMaster()
-		d.koalescer.Forget(stmt)
+
+		if d.koalescer != nil {
+			d.koalescer.Forget(key)
+		}
 	}
 
 	if d.koalescer == nil {
@@ -250,7 +263,7 @@ func (d *Database) Query(stmt string, values ...interface{}) (Rows, error) {
 		return ToRows(res)
 	}
 
-	resultCh := d.koalescer.DoChan(stmt, func() (interface{}, error) {
+	resultCh := d.koalescer.DoChan(key, func() (interface{}, error) {
 		res, err := source.Query(stmt, values...)
 		if err != nil {
 			return nil, err
@@ -283,10 +296,18 @@ func (d *Database) QueryContext(ctx context.Context, stmt string, values ...inte
 	d.Hooks.Emit(EventBeforeQueryRun, stmt, values)
 
 	source := d.selectSource()
+	key := ""
+
+	if d.koalescer != nil {
+		key = ToKey(stmt, values...)
+	}
 
 	if isDML(strings.ToLower(stmt)) {
 		source = d.getMaster()
-		d.koalescer.ForgetWithContext(ctx, stmt)
+
+		if d.koalescer != nil {
+			d.koalescer.ForgetWithContext(ctx, key)
+		}
 	}
 
 	if d.koalescer == nil {
@@ -298,7 +319,7 @@ func (d *Database) QueryContext(ctx context.Context, stmt string, values ...inte
 		return ToRows(res)
 	}
 
-	resultCh := d.koalescer.DoWithContext(ctx, stmt, func() (interface{}, error) {
+	resultCh := d.koalescer.DoWithContext(ctx, key, func() (interface{}, error) {
 		res, err := source.QueryContext(ctx, stmt, values...)
 		if err != nil {
 			return nil, err
@@ -329,12 +350,30 @@ func (d *Database) QueryRow(stmt string, values ...interface{}) (*Row, error) {
 	d.Hooks.Emit(EventBeforeQueryRun, stmt, values)
 
 	source := d.selectSource()
+	key := ""
+
+	if d.koalescer != nil {
+		key = ToKey(stmt, values...)
+	}
 
 	if isDML(strings.ToLower(stmt)) {
 		source = d.getMaster()
+
+		if d.koalescer != nil {
+			d.koalescer.Forget(key)
+		}
 	}
 
-	resultCh := d.koalescer.DoChan(stmt, func() (interface{}, error) {
+	if d.koalescer == nil {
+		res, err := source.Query(stmt, values...)
+		if err != nil {
+			return nil, err
+		}
+
+		return ToRow(res)
+	}
+
+	resultCh := d.koalescer.DoChan(key, func() (interface{}, error) {
 		res, err := source.Query(stmt, values...)
 		if err != nil {
 			return nil, err
@@ -366,12 +405,30 @@ func (d *Database) QueryRowContext(ctx context.Context, stmt string, values ...i
 	d.Hooks.Emit(EventBeforeQueryRun, stmt, values)
 
 	source := d.selectSource()
+	key := ""
+
+	if d.koalescer != nil {
+		key = ToKey(stmt, values...)
+	}
 
 	if isDML(strings.ToLower(stmt)) {
 		source = d.getMaster()
+
+		if d.koalescer != nil {
+			d.koalescer.ForgetWithContext(ctx, key)
+		}
 	}
 
-	resultCh := d.koalescer.DoWithContext(ctx, stmt, func() (interface{}, error) {
+	if d.koalescer == nil {
+		res, err := source.QueryContext(ctx, stmt, values...)
+		if err != nil {
+			return nil, err
+		}
+
+		return ToRow(res)
+	}
+
+	resultCh := d.koalescer.DoWithContext(ctx, key, func() (interface{}, error) {
 		res, err := source.QueryContext(ctx, stmt, values...)
 		if err != nil {
 			return nil, err
