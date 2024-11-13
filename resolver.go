@@ -196,17 +196,17 @@ func (d *Database) Exec(stmt string, values ...interface{}) (sql.Result, error) 
 		return d.selectSource().Exec(stmt, values...)
 	}
 
-	defer func() {
-		if d.koalescer != nil {
-			d.koalescer.Forget(stmt)
-		}
-	}()
-
 	// If dml statement is not executed in write mode
 	// throw error
 	if !d.isWriteMode() {
 		return nil, ErrorInvalidDBMode
 	}
+
+	defer func() {
+		if d.koalescer != nil {
+			d.koalescer.Forget(stmt)
+		}
+	}()
 
 	return d.getMaster().Exec(stmt, values...)
 }
@@ -218,6 +218,10 @@ func (d *Database) ExecContext(ctx context.Context, stmt string, values ...inter
 		return d.selectSource().ExecContext(ctx, stmt, values...)
 	}
 
+	if !d.isWriteMode() {
+		return nil, ErrorInvalidDBMode
+	}
+
 	defer func() {
 		if d.koalescer != nil {
 			d.koalescer.ForgetWithContext(ctx, stmt)
@@ -227,82 +231,6 @@ func (d *Database) ExecContext(ctx context.Context, stmt string, values ...inter
 	return d.getMaster().ExecContext(ctx, stmt, values...)
 }
 
-type Row []interface{}
-type Rows []*Row
-
-func ToRows(rows *sql.Rows) (Rows, error) {
-	defer rows.Close()
-
-	// Get column names
-	columns, err := rows.Columns()
-	if err != nil {
-		return nil, err
-	}
-
-	var results Rows
-
-	// Create a slice to hold the values for each row
-	for rows.Next() {
-		values := make(Row, len(columns))
-		valuePtrs := make(Row, len(columns))
-
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
-			return nil, err
-		}
-
-		results = append(results, &values)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	return results, nil
-}
-
-func ToRow(rows *sql.Rows) (*Row, error) {
-	defer rows.Close()
-
-	columns, err := rows.Columns()
-	if err != nil {
-		return nil, err
-	}
-
-	values := make(Row, len(columns))
-	valuePtrs := make(Row, len(columns))
-
-	for i := range values {
-		valuePtrs[i] = &values[i]
-	}
-
-	if rows.Next() {
-		values := make(Row, len(columns))
-		valuePtrs := make(Row, len(columns))
-
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		err = rows.Scan(valuePtrs...)
-		if err != nil {
-			return nil, err
-		}
-
-		return &values, nil
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	return nil, errors.New("something_went_wrong")
-
-}
-
 func (d *Database) Query(stmt string, values ...interface{}) (Rows, error) {
 	d.Hooks.Emit(EventBeforeQueryRun, stmt, values)
 
@@ -310,6 +238,7 @@ func (d *Database) Query(stmt string, values ...interface{}) (Rows, error) {
 
 	if isDML(strings.ToLower(stmt)) {
 		source = d.getMaster()
+		d.koalescer.Forget(stmt)
 	}
 
 	if d.koalescer == nil {
@@ -333,12 +262,13 @@ func (d *Database) Query(stmt string, values ...interface{}) (Rows, error) {
 	result := <-resultCh
 
 	if result.Err != nil {
-		res, err := source.Query(stmt, values...)
-		if err != nil {
-			return nil, err
-		}
-
-		return ToRows(res)
+		// res, err := source.Query(stmt, values...)
+		// if err != nil {
+		// 	return nil, err
+		// }
+		//
+		// return ToRows(res)
+		return nil, result.Err
 	}
 
 	rows, ok := result.Val.(Rows)
@@ -356,6 +286,7 @@ func (d *Database) QueryContext(ctx context.Context, stmt string, values ...inte
 
 	if isDML(strings.ToLower(stmt)) {
 		source = d.getMaster()
+		d.koalescer.ForgetWithContext(ctx, stmt)
 	}
 
 	if d.koalescer == nil {
@@ -378,11 +309,12 @@ func (d *Database) QueryContext(ctx context.Context, stmt string, values ...inte
 
 	result := <-resultCh
 	if result.Err != nil {
-		res, err := source.QueryContext(ctx, stmt, values...)
-		if err != nil {
-			return nil, err
-		}
-		return ToRows(res)
+		// res, err := source.QueryContext(ctx, stmt, values...)
+		// if err != nil {
+		// 	return nil, err
+		// }
+		// return ToRows(res)
+		return nil, result.Err
 	}
 
 	rows, ok := result.Val.(Rows)
@@ -413,12 +345,13 @@ func (d *Database) QueryRow(stmt string, values ...interface{}) (*Row, error) {
 
 	result := <-resultCh
 	if result.Err != nil {
-		res, err := source.Query(stmt, values...)
-		if err != nil {
-			return nil, err
-		}
-
-		return ToRow(res)
+		// res, err := source.Query(stmt, values...)
+		// if err != nil {
+		// 	return nil, err
+		// }
+		//
+		// return ToRow(res)
+		return nil, result.Err
 	}
 
 	row, ok := result.Val.(*Row)
@@ -449,12 +382,13 @@ func (d *Database) QueryRowContext(ctx context.Context, stmt string, values ...i
 
 	result := <-resultCh
 	if result.Err != nil {
-		res, err := source.QueryContext(ctx, stmt, values...)
-		if err != nil {
-			return nil, err
-		}
-
-		return ToRow(res)
+		// res, err := source.QueryContext(ctx, stmt, values...)
+		// if err != nil {
+		// 	return nil, err
+		// }
+		//
+		// return ToRow(res)
+		return nil, result.Err
 	}
 
 	row, ok := result.Val.(*Row)
