@@ -1,14 +1,14 @@
 <!--
   Title: DBResolver
-  Description: Resolve between read and write database automatically for gorm. go-gorm-v1 ,dbresolver
+  Description: Resolve between read and write database automatically for gorm. go-batteries ,dbresolver
   Author: amitavaghosh1
   -->
 
 # DBResolver
 
-DBResolver for [gorm v1](https://v1.gorm.io/docs/index.html). This adds functionality to switch between read and write databases.
+Switch between read and write databases. Coalesce requests.
 
-[Repo](https://github.com/go-gorm-v1/dbresolver)
+[Repo](https://github.com/go-batteries/dbresolver)
 
 
 ## Quick Start
@@ -16,7 +16,7 @@ DBResolver for [gorm v1](https://v1.gorm.io/docs/index.html). This adds function
 #### Importing
 
 ```bash
-go get github.com/go-gorm-v1/dbresolver@v1.0.3 
+go get github.com/go-batteries/dbresolver@latest 
 ```
 
 
@@ -24,92 +24,86 @@ go get github.com/go-gorm-v1/dbresolver@v1.0.3
 
 ```go
 import (
-  "github.com/go-gorm-v1/dbresolver"
-  "github.com/jinzhu/gorm"
+  "github.com/go-batteries/dbresolver"
   _ "github.com/mattn/go-sqlite3"
 )
 
-func setDatabaseDefaults(db *gorm.DB) {
-	db.DB().SetMaxIdleConns(MAX_IDLE_CONNECTIONS)
-	db.DB().SetConnMaxLifetime(CONN_MAX_LIFETIME)
-	db.DB().SetMaxOpenConns(MAX_OPEN_CONNECTIONS)
+func setDatabaseDefaults(db *sql.DB) {
+	db.SetMaxIdleConns(MAX_IDLE_CONNECTIONS)
+	db.SetConnMaxLifetime(CONN_MAX_LIFETIME)
+	db.SetMaxOpenConns(MAX_OPEN_CONNECTIONS)
 	db.LogMode(true)
 }
 
 func Setup() *dbresolver.Database {
-    masterDB, err := gorm.Open("sqlite3", "./testdbs/users_write.db")
+    masterDB, err := sql.Open("sqlite3", "./testdbs/users_write.db")
     if err != nil {
       log.Fatal("failed to connect to db", err)
     }
 
     setDatabaseDefaults(masterDB)
 
-    replicaDBs := []*gorm.DB{}
+    replicaDBs := []*dbresolver.ResolverDB{}
     
-    replica, err := gorm.Open("sqlite3", "./testdbs/users_read_a.db")
+    replica, err := sql.Open("sqlite3", "./testdbs/users_read_a.db")
     if err != nil {
       log.Fatal("failed to connect to db", err)
     }
 
     setDatabaseDefaults(replica)
+    replicaDBs = append(replicaDBs, dbresolver.AsSyncReplica(replica, "users_read_replica1"))
 
-    replicaDBs = append(replicaDBs, replica)
-
-    replica, err = gorm.Open("sqlite3", "./testdbs/users_read_b.db")
+    replica, err = sql.Open("sqlite3", "./testdbs/users_read_b.db")
     if err != nil {
       log.Fatal("failed to connect to db", err)
     }
 
     setDatabaseDefaults(replica)
+    replicaDBs = append(replicaDBs, dbresolver.AsReplica(replica, "users_read_replica2"))
 
-    replicaDBs = append(replicaDBs, replica)
 
     return dbresolver.Register(dbresolver.DBConfig{
-        Master:   masterDB,
+        Master:   dbresolver.AsMaster(masterDB, "users_wrtie"),
         Replicas: replicaDBs,
         // Policy: &dbresolver.RoundRobalancer{},
-        // for existing database integration add this
+        // for existing database integration, default mode to write
         // DefaultMode: &dbresolver.DbWriteMode,
+        // MaxIdleConnections: dbresolver.ToPtr(30),
+        // MaxOpenConnections: ,
+        // ConnectionMaxLifeTime: ,
     })
 }
 
 db := Setup()
 
-db.Raw(`SELECT * FROM users`)
+db.QueryRow(`SELECT * FROM users`)
 ```
-
 
 ### Switching data source
 
 It is possible to provide the option to use read or write forcefully.
 
 ```go
-// Raw By default uses read db
-db.Raw(`SELECT * FROM users`)
-
 // Use write db
-db.WithMode(dbresolver.DBWriteMode).Raw(`SELECT * FROM users`)
+db.WithMode(dbresolver.DBWriteMode).QueryRow(`SELECT * FROM users`)
 
 // Use read db
-db.WithMode(dbresolver.DBReadMode).Exec(`DELETE FROM users`)
+db.WithMode(dbresolver.DBReadMode).Exec(`DELETE FROM users`) // error
+db.WithMode(dbresolver.DBWriteMode).Exec(`DELETE FROM users`) // works
+
+// if you need to work with DML queries on read instance
+// use the sql.DB object
+
+replicaDB.DB.Exec(`DELETE FROM users`);
 ```
 
-It is also possible to set the default mode to write mode. 
-
-This uses write mode for all [Query](https://v1.gorm.io/docs/query.html) methods apart from `Where`
-
-- `Find`
-- `First`
-- `Last`
-- `Take`
-- `Count`
+It is also possible to set the default mode to read/write mode.
 
 ```go
 dbresolver.DBConfig {
     DefaultMode: &dbresolver.DbWriteMode
 }
 ```
-
 
 ### Load Balancing
 
@@ -134,4 +128,3 @@ type Balancer interface {
     Get() int64
 }
 ```
-

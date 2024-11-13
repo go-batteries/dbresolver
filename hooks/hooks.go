@@ -16,6 +16,12 @@ type Result struct {
 
 type EventHandler func(args ...interface{}) Result
 
+type EventEmitter interface {
+	On(eventName string, handler EventHandler)
+	Off(eventName string)
+	Emit(eventName string, args ...interface{}) Result
+}
+
 type Event struct {
 	Name string
 	Fn   EventHandler

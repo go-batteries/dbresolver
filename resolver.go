@@ -1,41 +1,76 @@
 package dbresolver
 
 import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
 	"log"
 	"strings"
+	"time"
 
-	"github.com/go-gorm-v1/dbresolver/hooks"
-	"github.com/jinzhu/gorm"
+	"github.com/go-batteries/dbresolver/hooks"
 )
+
+const (
+	DEFAULT_MAX_IDLE_CONNECTIONS = 30
+	DEFAULT_CONN_MAX_LIFETIME    = 10 * time.Minute
+	DEFAULT_MAX_OPEN_CONNECTIONS = 10
+)
+
+type ResolverDB struct {
+	*sql.DB
+
+	Name     string
+	IsMaster bool
+	InSync   bool
+	isUp     bool
+}
+
+func NewResolveDB(db *sql.DB, name string, isMaster, inSync bool) *ResolverDB {
+	return &ResolverDB{
+		DB: db,
+
+		Name:     name,
+		IsMaster: isMaster,
+		InSync:   inSync,
+	}
+}
+
+func AsMaster(db *sql.DB, name string) *ResolverDB {
+	return NewResolveDB(db, name, true, true)
+}
+
+func AsReplica(db *sql.DB, name string) *ResolverDB {
+	return NewResolveDB(db, name, false, false)
+}
+
+func AsSyncReplica(db *sql.DB, name string) *ResolverDB {
+	return NewResolveDB(db, name, false, true)
+}
+
+func (rd *ResolverDB) UnWrap() *sql.DB {
+	return rd.DB
+}
+
+func (rd *ResolverDB) CheckHealth(ctx context.Context) error {
+	err := rd.DB.PingContext(ctx)
+	rd.isUp = err == nil
+
+	return err
+}
 
 type DBConfig struct {
-	Master      *gorm.DB
-	Replicas    []*gorm.DB
-	Policy      Balancer
-	DefaultMode *DbActionMode
+	Master                *ResolverDB
+	Replicas              []*ResolverDB
+	Policy                Balancer
+	DefaultMode           *DbActionMode
+	MaxIdleConnections    *int
+	MaxOpenConnections    *int
+	ConnectionMaxLifetime *time.Duration
 }
 
-type DbActionMode string
-
-var (
-	DbWriteMode DbActionMode = "write"
-	DbReadMode  DbActionMode = "read"
-)
-
-var (
-	EventBeforeDBSelect string = "before::select_db"
-	EventAfterDBSelect  string = "after:select_db"
-	EventBeforeQueryRun string = "before::query_run"
-)
-
-type Database struct {
-	// this makes sure, calls like Save Update etc, goes through default source db
-	*gorm.DB
-	Config DBConfig
-	Hooks  *hooks.EventStore
-}
-
-func Register(config DBConfig) *Database {
+func Register(config DBConfig, opts ...DataBaseOpts) *Database {
 	if config.Master == nil {
 		log.Fatal("config.Master db cannot be nil")
 	}
@@ -57,103 +92,398 @@ func Register(config DBConfig) *Database {
 		config.DefaultMode = &DbReadMode
 	}
 
-	return &Database{
-		DB:     config.Master,
+	database := &Database{
 		Config: config,
 		Hooks:  hooks.NewEventStore(),
 	}
+
+	database.Config.applyConnectionConfig()
+
+	for _, opt := range opts {
+		opt(database)
+	}
+
+	return database
 }
 
-func (d *Database) WithMode(dbMode DbActionMode) *gorm.DB {
+func (cfg *DBConfig) applyConnectionConfig() {
+	SetConfigDefaults(cfg.Master.DB, cfg)
+
+	for _, replica := range cfg.Replicas {
+		SetConfigDefaults(replica.DB, cfg)
+	}
+}
+
+// Optional CheckHealth to validate database connection health
+func (cfg *DBConfig) CheckHealth(ctx context.Context) error {
+	masterErr := cfg.Master.CheckHealth(ctx)
+	replicaErrors := []error{}
+
+	for _, replica := range cfg.Replicas {
+		replicaErrors = append(replicaErrors, replica.CheckHealth(ctx))
+	}
+
+	if masterErr == nil && len(replicaErrors) == 0 {
+		return nil
+	}
+
+	var err error
+	if masterErr != nil {
+		err = fmt.Errorf("master error: %v\n", masterErr)
+	}
+
+	for _, replicaErr := range replicaErrors {
+		err = fmt.Errorf("replica error: %v\n", replicaErr)
+	}
+
+	return err
+}
+
+type DbActionMode string
+
+var (
+	DbWriteMode DbActionMode = "write"
+	DbReadMode  DbActionMode = "read"
+)
+
+var (
+	EventBeforeDBSelect string = "before::select_db"
+	EventAfterDBSelect  string = "after:select_db"
+	EventBeforeQueryRun string = "before::query_run"
+)
+
+var (
+	ErrorInvalidDBMode = errors.New("db mode invalid for query")
+	ErrorInvalidData   = errors.New("unexpected result type from query koalescer")
+)
+
+type Database struct {
+	Config    DBConfig
+	Hooks     hooks.EventEmitter
+	koalescer *QueryKoalescer
+}
+
+type DataBaseOpts func(d *Database)
+
+func WithQueryQualescer(koalescer *QueryKoalescer) DataBaseOpts {
+	return func(d *Database) {
+		d.koalescer = koalescer
+	}
+}
+
+func WithHooks(eventHandler hooks.EventEmitter) DataBaseOpts {
+	return func(d *Database) {
+		d.Hooks = eventHandler
+	}
+}
+
+func (d *Database) WithMode(dbMode DbActionMode) *Database {
 	dbConfig := d.Config
 	dbConfig.DefaultMode = &dbMode
 
 	nd := &Database{
-		DB:     d.DB,
 		Config: dbConfig,
 		Hooks:  d.Hooks,
 	}
 
-	return nd.selectSource()
-	// if dbMode == DbWriteMode {
-	// return d.getMaster()
-	// }
-
-	// return d.getReplica()
+	return nd
 }
 
-func (d *Database) Exec(sql string, values ...interface{}) *gorm.DB {
-	master := d.getMaster()
+func (d *Database) Exec(stmt string, values ...interface{}) (sql.Result, error) {
+	d.Hooks.Emit(EventBeforeQueryRun, stmt, values)
 
-	if !isDML(strings.ToLower(sql)) {
-		return d.getReplica().Exec(sql, values...)
+	if !isDML(strings.ToLower(stmt)) {
+		return d.selectSource().Exec(stmt, values...)
 	}
 
-	d.Hooks.Emit(EventBeforeQueryRun, sql, values)
-	return master.Exec(sql, values...)
-}
+	defer func() {
+		if d.koalescer != nil {
+			d.koalescer.Forget(stmt)
+		}
+	}()
 
-func (d *Database) Raw(sql string, values ...interface{}) *gorm.DB {
-	if isDML(strings.ToLower(sql)) {
-		return d.getMaster().Raw(sql, values...)
+	// If dml statement is not executed in write mode
+	// throw error
+	if !d.isWriteMode() {
+		return nil, ErrorInvalidDBMode
 	}
 
-	d.Hooks.Emit(EventBeforeQueryRun, sql, values)
-	return d.selectSource().Raw(sql, values...)
+	return d.getMaster().Exec(stmt, values...)
 }
 
-func (d *Database) Where(query interface{}, args ...interface{}) *gorm.DB {
-	d.Hooks.Emit(EventBeforeQueryRun, query, args)
-	return d.selectSource().Where(query, args...)
+func (d *Database) ExecContext(ctx context.Context, stmt string, values ...interface{}) (sql.Result, error) {
+	d.Hooks.Emit(EventBeforeQueryRun, stmt, values)
+
+	if !isDML(strings.ToLower(stmt)) {
+		return d.selectSource().ExecContext(ctx, stmt, values...)
+	}
+
+	defer func() {
+		if d.koalescer != nil {
+			d.koalescer.ForgetWithContext(ctx, stmt)
+		}
+	}()
+
+	return d.getMaster().ExecContext(ctx, stmt, values...)
 }
 
-func (d *Database) Find(query interface{}, args ...interface{}) *gorm.DB {
-	d.Hooks.Emit(EventBeforeQueryRun, query, args)
-	return d.selectSource().Find(query, args...)
+type Row []interface{}
+type Rows []*Row
+
+func ToRows(rows *sql.Rows) (Rows, error) {
+	defer rows.Close()
+
+	// Get column names
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	var results Rows
+
+	// Create a slice to hold the values for each row
+	for rows.Next() {
+		values := make(Row, len(columns))
+		valuePtrs := make(Row, len(columns))
+
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return nil, err
+		}
+
+		results = append(results, &values)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return results, nil
 }
 
-func (d *Database) First(query interface{}, args ...interface{}) *gorm.DB {
-	d.Hooks.Emit(EventBeforeQueryRun, query, args)
-	return d.selectSource().First(query, args...)
+func ToRow(rows *sql.Rows) (*Row, error) {
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	values := make(Row, len(columns))
+	valuePtrs := make(Row, len(columns))
+
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	if rows.Next() {
+		values := make(Row, len(columns))
+		valuePtrs := make(Row, len(columns))
+
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		err = rows.Scan(valuePtrs...)
+		if err != nil {
+			return nil, err
+		}
+
+		return &values, nil
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return nil, errors.New("something_went_wrong")
+
 }
 
-func (d *Database) Last(query interface{}, args ...interface{}) *gorm.DB {
-	d.Hooks.Emit(EventBeforeQueryRun, query, args)
-	return d.selectSource().Last(query, args...)
+func (d *Database) Query(stmt string, values ...interface{}) (Rows, error) {
+	d.Hooks.Emit(EventBeforeQueryRun, stmt, values)
+
+	source := d.selectSource()
+
+	if isDML(strings.ToLower(stmt)) {
+		source = d.getMaster()
+	}
+
+	if d.koalescer == nil {
+		res, err := source.Query(stmt, values...)
+		if err != nil {
+			return nil, err
+		}
+
+		return ToRows(res)
+	}
+
+	resultCh := d.koalescer.DoChan(stmt, func() (interface{}, error) {
+		res, err := source.Query(stmt, values...)
+		if err != nil {
+			return nil, err
+		}
+
+		return ToRows(res)
+	})
+
+	result := <-resultCh
+
+	if result.Err != nil {
+		res, err := source.Query(stmt, values...)
+		if err != nil {
+			return nil, err
+		}
+
+		return ToRows(res)
+	}
+
+	rows, ok := result.Val.(Rows)
+	if !ok {
+		return nil, fmt.Errorf("unexpected result type from query koalescer")
+	}
+
+	return rows, nil
 }
 
-func (d *Database) Take(query interface{}, args ...interface{}) *gorm.DB {
-	d.Hooks.Emit(EventBeforeQueryRun, query, args)
-	return d.selectSource().Take(query, args...)
+func (d *Database) QueryContext(ctx context.Context, stmt string, values ...interface{}) (Rows, error) {
+	d.Hooks.Emit(EventBeforeQueryRun, stmt, values)
+
+	source := d.selectSource()
+
+	if isDML(strings.ToLower(stmt)) {
+		source = d.getMaster()
+	}
+
+	if d.koalescer == nil {
+		res, err := source.QueryContext(ctx, stmt, values...)
+		if err != nil {
+			return nil, err
+		}
+
+		return ToRows(res)
+	}
+
+	resultCh := d.koalescer.DoWithContext(ctx, stmt, func() (interface{}, error) {
+		res, err := source.QueryContext(ctx, stmt, values...)
+		if err != nil {
+			return nil, err
+		}
+
+		return ToRows(res)
+	})
+
+	result := <-resultCh
+	if result.Err != nil {
+		res, err := source.QueryContext(ctx, stmt, values...)
+		if err != nil {
+			return nil, err
+		}
+		return ToRows(res)
+	}
+
+	rows, ok := result.Val.(Rows)
+	if !ok {
+		return nil, ErrorInvalidData
+	}
+
+	return rows, nil
 }
 
-func (d *Database) Count(value interface{}) *gorm.DB {
-	return d.selectSource().Count(value)
+func (d *Database) QueryRow(stmt string, values ...interface{}) (*Row, error) {
+	d.Hooks.Emit(EventBeforeQueryRun, stmt, values)
+
+	source := d.selectSource()
+
+	if isDML(strings.ToLower(stmt)) {
+		source = d.getMaster()
+	}
+
+	resultCh := d.koalescer.DoChan(stmt, func() (interface{}, error) {
+		res, err := source.Query(stmt, values...)
+		if err != nil {
+			return nil, err
+		}
+
+		return ToRow(res)
+	})
+
+	result := <-resultCh
+	if result.Err != nil {
+		res, err := source.Query(stmt, values...)
+		if err != nil {
+			return nil, err
+		}
+
+		return ToRow(res)
+	}
+
+	row, ok := result.Val.(*Row)
+	if !ok {
+		return nil, ErrorInvalidData
+	}
+
+	return row, nil
 }
 
-func (d *Database) Save(value interface{}) *gorm.DB {
-	return d.getMaster().Save(value)
+func (d *Database) QueryRowContext(ctx context.Context, stmt string, values ...interface{}) (*Row, error) {
+	d.Hooks.Emit(EventBeforeQueryRun, stmt, values)
+
+	source := d.selectSource()
+
+	if isDML(strings.ToLower(stmt)) {
+		source = d.getMaster()
+	}
+
+	resultCh := d.koalescer.DoWithContext(ctx, stmt, func() (interface{}, error) {
+		res, err := source.QueryContext(ctx, stmt, values...)
+		if err != nil {
+			return nil, err
+		}
+
+		return ToRow(res)
+	})
+
+	result := <-resultCh
+	if result.Err != nil {
+		res, err := source.QueryContext(ctx, stmt, values...)
+		if err != nil {
+			return nil, err
+		}
+
+		return ToRow(res)
+	}
+
+	row, ok := result.Val.(*Row)
+	if !ok {
+		return nil, ErrorInvalidData
+	}
+
+	return row, nil
 }
 
-func (d *Database) getReplica() (db *gorm.DB) {
+func (d *Database) getReplica() (db *ResolverDB) {
 	nextIdx := d.Config.Policy.Get()
 
-	db = d.DB
+	db = d.Config.Master
 
 	if len(d.Config.Replicas) > 0 && nextIdx < int64(len(d.Config.Replicas)) {
 		db = d.Config.Replicas[nextIdx]
 	}
 
-	d.Hooks.Emit(EventAfterDBSelect, "replica", db, nextIdx)
+	d.Hooks.Emit(EventAfterDBSelect, "replica", db.Name, nextIdx)
 	return
 }
 
-func (d *Database) getMaster() *gorm.DB {
-	d.Hooks.Emit(EventAfterDBSelect, "master", d.DB, 0)
-	return d.DB
+func (d *Database) getMaster() *ResolverDB {
+	d.Hooks.Emit(EventAfterDBSelect, "master", d.Config.Master.Name, 0)
+	return d.Config.Master
 }
 
-func (d *Database) selectSource() *gorm.DB {
+func (d *Database) selectSource() *ResolverDB {
 	d.Hooks.Emit(EventBeforeDBSelect, *d.Config.DefaultMode)
 
 	if DbWriteMode == *d.Config.DefaultMode {
@@ -161,6 +491,10 @@ func (d *Database) selectSource() *gorm.DB {
 	}
 
 	return d.getReplica()
+}
+
+func (d *Database) isWriteMode() bool {
+	return DbWriteMode == *d.Config.DefaultMode
 }
 
 func isDML(sql string) bool {
@@ -173,9 +507,10 @@ func isDML(sql string) bool {
 	if isSelect && isLockQuery {
 		return true
 	}
-	if isSelect {
-		return false
-	}
 
-	return true
+	return !isSelect
+}
+
+func ToPtr[E any](e E) *E {
+	return &e
 }

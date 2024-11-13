@@ -5,6 +5,6 @@ if [[ -z "$1" ]]; then
 elif [[ "$1" == "all" ]]; then
     go test -v ./...
 else
-    go test -v "github.com/go-gorm-v1/$1"
+    go test -v "github.com/go-batteries/$1"
 fi
 
