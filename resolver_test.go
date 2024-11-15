@@ -1,6 +1,7 @@
 package dbresolver
 
 import (
+	"database/sql"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -38,170 +39,132 @@ func TestIsDML(t *testing.T) {
 	})
 }
 
-// type DBResolverSuite struct {
-// 	suite.Suite
-// 	database *Database
-// 	MasterDB *gorm.DB
-// 	Replicas []*gorm.DB
-// }
-//
-// func (dbs *DBResolverSuite) SetupTest() {
-// 	masterDB, err := gorm.Open("sqlite3", "./testdbs/users_write.db")
-// 	t := dbs.Suite.T()
-// 	require.NoError(t, err, "failed to connect to write db")
-//
-// 	replicaDBs := []*gorm.DB{}
-// 	replica, err := gorm.Open("sqlite3", "./testdbs/users_read_a.db?mode=ro")
-// 	require.NoError(t, err, "failed  to connect to read instance a")
-//
-// 	replicaDBs = append(replicaDBs, replica)
-//
-// 	replica, err = gorm.Open("sqlite3", "./testdbs/users_read_b.db?mode=ro")
-// 	require.NoError(t, err, "failed  to connect to read instance b")
-//
-// 	replicaDBs = append(replicaDBs, replica)
-//
-// 	dbs.database = Register(DBConfig{
-// 		Master:   masterDB,
-// 		Replicas: replicaDBs,
-// 	})
-//
-// }
-//
-// type User struct {
-// 	ID    string
-// 	Email string
-// }
-//
-// func (dbs *DBResolverSuite) TestRawQueries() {
-// 	t := dbs.Suite.T()
-//
-// 	t.Run("with automatic switching to replica", func(t *testing.T) {
-// 		recv := make(chan string, 2)
-//
-// 		for i := 0; i < 2; i++ {
-// 			go func() {
-// 				var result User
-// 				err := dbs.database.Raw("SELECT email FROM users WHERE id=?", "a").Scan(&result).Error
-// 				require.NoError(t, err, "should not have failed to get users from database")
-//
-// 				recv <- result.Email
-// 			}()
-// 		}
-//
-// 		emails := []string{}
-//
-// 		var fetchFailed error
-//
-// 		for i := 0; i < 2; i++ {
-// 			select {
-// 			case email := <-recv:
-// 				emails = append(emails, email)
-// 			case <-time.After(2 * time.Second):
-// 				fetchFailed = errors.New("failed")
-// 			}
-// 		}
-//
-// 		require.NoError(t, fetchFailed, "should not have failed to get data")
-// 		require.ElementsMatch(t, emails, []string{"dad@gmail.com", "foo@gmail.com"})
-// 	})
-//
-// 	t.Run("selecting db mode manually", func(t *testing.T) {
-// 		var result User
-//
-// 		err := dbs.database.WithMode(DbWriteMode).Raw("SELECT * FROM users WHERE id = ?", "a").Scan(&result).Error
-// 		require.NoError(t, err, "should not have failed to get users from write db")
-//
-// 		require.Equal(t, result.Email, "baz@gmail.com")
-// 	})
-// }
-//
-// func (dbs *DBResolverSuite) TestExecQuery() {
-// 	t := dbs.Suite.T()
-//
-// 	dbs.database.Hooks.On(EventAfterDBSelect, func(args ...interface{}) hooks.Result {
-// 		dbMode, ok := args[0].(string)
-// 		require.True(t, ok, "should have received db mode")
-//
-// 		require.Equal(t, dbMode, "master")
-// 		return hooks.Result{}
-// 	})
-//
-// 	err := dbs.database.Exec(`INSERT INTO users (id, email) VALUES(?, ?)`, "c", "boo@gmail.com").Error
-// 	require.NoError(t, err, "failed to insert into db")
-//
-// 	dbs.database.Hooks.Off(EventAfterDBSelect)
-//
-// 	var result User
-//
-// 	err = dbs.database.WithMode(DbWriteMode).Raw("SELECT email FROM users WHERE id = ?", "c").Scan(&result).Error
-// 	require.NoError(t, err, "failed to get email from id")
-//
-// 	require.Equal(t, result.Email, "boo@gmail.com")
-//
-// 	err = dbs.database.Exec("DELETE FROM users WHERE id = ?", "c").Error
-// 	require.NoError(t, err, "failed to delete from db")
-// }
-//
-// func (dbs *DBResolverSuite) TestUpdate() {
-// 	t := dbs.Suite.T()
-//
-// 	err := dbs.database.Exec(`INSERT INTO users (id, email) VALUES(?, ?)`, "c", "boo@gmail.com").Error
-// 	require.NoError(t, err, "failed to insert into db")
-//
-// 	var result User
-//
-// 	err = dbs.database.Model(&User{}).Where("id = ?", "c").Update("email", "boohoo@gmail.com").Error
-// 	require.NoError(t, err, "should not have failed to update")
-//
-// 	err = dbs.database.WithMode(DbWriteMode).Raw("SELECT email FROM users WHERE id = ?", "c").Scan(&result).Error
-// 	require.NoError(t, err, "should not have failed to get from database")
-//
-// 	require.Equal(t, result.Email, "boohoo@gmail.com")
-//
-// 	result = User{}
-//
-// 	err = dbs.database.Raw("SELECT email FROM users WHERE id = ?", "c").Scan(&result).Error
-// 	require.Error(t, err, "should have failed to get from database")
-//
-// 	err = dbs.database.Exec("DELETE FROM users WHERE id = ?", "c").Error
-// 	require.NoError(t, err, "failed to delete from db")
-// }
-//
-// func (dbs *DBResolverSuite) TestFind() {
-// 	t := dbs.Suite.T()
-//
-// 	var user = User{ID: "a"}
-//
-// 	dbs.database.Hooks.On(EventAfterDBSelect, func(args ...interface{}) hooks.Result {
-// 		dbMode, ok := args[0].(string)
-// 		require.True(t, ok, "should have received db mode")
-//
-// 		require.Equal(t, dbMode, "replica")
-// 		return hooks.Result{}
-// 	})
-//
-// 	err := dbs.database.WithMode(DbReadMode).Find(&user).Error
-// 	require.NoError(t, err, "should not have failed to fetch")
-//
-// 	require.Equal(t, user.Email, "foo@gmail.com")
-// 	dbs.database.Hooks.Off(EventAfterDBSelect)
-//
-// 	dbs.database.Hooks.On(EventAfterDBSelect, func(args ...interface{}) hooks.Result {
-// 		dbMode, ok := args[0].(string)
-// 		require.True(t, ok, "should have received db mode")
-//
-// 		require.Equal(t, dbMode, "master")
-// 		return hooks.Result{}
-// 	})
-//
-// 	err = dbs.database.WithMode(DbWriteMode).Find(&user).Error
-// 	require.NoError(t, err, "should not have failed to fetch")
-//
-// 	require.Equal(t, user.Email, "baz@gmail.com")
-// 	dbs.database.Hooks.Off(EventAfterDBSelect)
-// }
-//
-// func TestDBResolver(t *testing.T) {
-// 	suite.Run(t, new(DBResolverSuite))
-// }
+func setupTestDB() (*Database, error) {
+	masterDB, err := sql.Open("sqlite3", "./tmp/master.db")
+	if err != nil {
+		return nil, err
+	}
+	replicaDB, err := sql.Open("sqlite3", "./tmp/replica.db")
+	if err != nil {
+		return nil, err
+	}
+
+	// Create tables in master and replica to simulate behavior
+	if _, err := masterDB.Exec("CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY, name TEXT); DELETE FROM test;"); err != nil {
+		return nil, err
+	}
+
+	if _, err := replicaDB.Exec("CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY, name TEXT); DELETE FROM test;"); err != nil {
+		return nil, err
+	}
+
+	return Register(
+		DBConfig{
+			Master:   AsMaster(masterDB, "master"),
+			Replicas: []*ResolverDB{AsReplica(replicaDB, "replica")},
+		},
+	), nil
+}
+
+func TestExec_WriteMode(t *testing.T) {
+	db, err := setupTestDB()
+	if err != nil {
+		t.Fatalf("failed to do whatever %v\n", err)
+	}
+
+	db = db.WithMode(DbWriteMode)
+
+	_, err = db.Exec("INSERT INTO test (name) VALUES (?)", "write-test")
+	if err != nil {
+		t.Fatalf("unexpected error executing write: %v", err)
+	}
+
+	rows, err := db.Query("SELECT name FROM test")
+	if err != nil {
+		t.Fatalf("failed to get rows %v\n", err)
+	}
+
+	if len(rows) == 0 {
+		t.Fatalf("expected row in master")
+	}
+
+	replicaRows, err := db.getReplica().DB.Query("SELECT name FROM test")
+	if err != nil {
+		t.Fatalf("failed to execute query from replica")
+	}
+
+	defer replicaRows.Close()
+	if replicaRows.Next() {
+		t.Fatalf("did not expect row in replica")
+	}
+}
+
+func TestQuery_ReadMode(t *testing.T) {
+	db, err := setupTestDB()
+	if err != nil {
+		t.Fatalf("failed to do whatever %v\n", err)
+	}
+
+	// Insert data directly into replica for testing
+	db.getReplica().DB.Exec("INSERT INTO test (name) VALUES (?)", "read-test")
+
+	rows, err := db.Query("SELECT name FROM test")
+	if err != nil {
+		t.Fatalf("unexpected error querying: %v", err)
+	}
+
+	if len(rows) == 0 {
+		t.Fatal("expected row in replica")
+	}
+}
+
+func Test_InvalidMode(t *testing.T) {
+	db, err := setupTestDB()
+	if err != nil {
+		t.Fatalf("failed to setup db. %v\n", err)
+	}
+
+	_, err = db.Exec("INSERT INTO test (name) VALUES ('switch-test-2')")
+	if err == nil {
+		t.Fatal("should have failed to insert in read mode")
+	}
+}
+
+func TestDBModeSwitch(t *testing.T) {
+	db, err := setupTestDB()
+	if err != nil {
+		t.Fatalf("failed to do whatever %v\n", err)
+	}
+
+	_, err = db.WithMode(DbWriteMode).Exec("INSERT INTO test (name) VALUES (?)", "switch-test")
+	if err != nil {
+		t.Fatalf("unexpected error executing write: %v", err)
+	}
+
+	rows, err := db.Query("SELECT name FROM test")
+	if err != nil {
+		t.Fatalf("failed to select name, %v\n", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("did not expect row in replica")
+	}
+
+	rows, err = db.WithMode(DbWriteMode).Query("SELECT name FROM test")
+	if err != nil {
+		t.Fatalf("failed to select name, %v\n", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row in master")
+	}
+
+	_, err = db.WithMode(DbWriteMode).Exec("INSERT INTO test (name) VALUES (?)", "switch-test-3")
+	if err != nil {
+		t.Fatalf("unexpected error executing write: %v", err)
+	}
+
+	// Ensure master has inserted and result is not cached by koalescer
+	rows, err = db.WithMode(DbWriteMode).Query("SELECT name FROM test")
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows in master")
+	}
+}
