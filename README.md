@@ -1,12 +1,20 @@
 <!--
   Title: DBResolver
-  Description: Resolve between read and write database automatically for gorm. go-batteries ,dbresolver
+  Description: Route reads to replicas and writes to master automatically, on top of database/sql. go-batteries, dbresolver
   Author: amitavaghosh1
   -->
 
 # DBResolver
 
-Switch between read and write databases. Coalesce requests.
+A thin layer over Go's standard `database/sql`: register one master and
+N replicas, and every query is routed to the right one automatically,
+write statements to master, reads to a load-balanced replica, without
+threading a "which DB" decision through your call sites. Falls back
+cleanly to the write DB if you have no replicas yet, so it's safe to
+adopt before you actually need read scaling.
+
+Built on `database/sql` directly (no ORM dependency), so it works with
+whatever driver you're already using.
 
 [Repo](https://github.com/go-batteries/dbresolver)
 
@@ -110,7 +118,7 @@ dbresolver.DBConfig {
 By default we have two balancers
 
 ```go
-// RandomBalancer
+// RoundRobalancer
 dbresolver.DBConfig{
     Policy: &dbresolver.RoundRobalancer{}
 }
